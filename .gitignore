@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+
+#data
+UCF-101/
+
 # Distribution / packaging
 .Python
 build/
