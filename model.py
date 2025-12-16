@@ -35,7 +35,7 @@ class CNN3D(nn.Module):
         return logits
     
 class ResnetVideoToSequenceEncoder(nn.Module):
-    def __init__(self, model='resnet50_ft_caffe_vggface2'):
+    def __init__(self, model='resnet18'):
         super(ResnetVideoToSequenceEncoder, self).__init__()
         self.model = timm.create_model(
                 model, 
@@ -96,3 +96,98 @@ class VideoClassificationModel(nn.Module):
         features = self.encoder(x)
         logits = self.classifier(features)
         return logits
+    
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.feature_maps = None
+        self.gradients = None
+        self.register_hooks()
+
+    def save_feature_maps(self, module, input, output):
+        # output shape is (Batch*Frames, Channels, Height, Width)
+        self.feature_maps = output
+
+    def save_gradients(self, grad):
+        # grad shape is (Batch*Frames, Channels, Height, Width)
+        self.gradients = grad
+
+    def register_hooks(self):
+        # 1. Register a hook to capture the output of the target layer (features)
+        self.target_layer.register_forward_hook(self.save_feature_maps)
+        
+        # 2. Register a hook to capture the gradients flowing into the target layer
+        self.target_layer.register_backward_hook(self.save_gradients)
+
+    def __call__(self, input_tensor, target_category=None):
+        # Ensure the model is in evaluation mode
+        self.model.eval()
+
+        # --- 1. Forward Pass ---
+        # The model's output is the logits (Batch_size, Num_classes)
+        logits = self.model(input_tensor)
+        
+        # --- 2. Target Identification ---
+        if target_category is None:
+            # Get the predicted class (the one with the highest logit)
+            target_category = torch.argmax(logits, dim=1).item()
+        
+        # Zero gradients before backward pass
+        self.model.zero_grad()
+        
+        # --- 3. Backward Pass ---
+        # Create a tensor of 1s for the target class output for the backward pass
+        # This is (Batch_size, Num_classes) but we only backpropagate the target class logit
+        one_hot = torch.zeros_like(logits)
+        one_hot[:, target_category] = 1
+        
+        # Backpropagate the gradient of the target class score
+        logits.backward(gradient=one_hot, retain_graph=True)
+        
+        # The gradients and feature_maps are now populated by the hooks
+        gradients = self.gradients
+        feature_maps = self.feature_maps # (B*T, C, H, W)
+
+        # --- 4. Grad-CAM Computation ---
+        batch_size, num_frames, _, _, _ = input_tensor.size()
+        C, H, W = feature_maps.size(1), feature_maps.size(2), feature_maps.size(3)
+
+        # Reshape the feature maps and gradients back to (B, T, C, H, W) for frame-wise processing
+        feature_maps = feature_maps.view(batch_size, num_frames, C, H, W)
+        gradients = gradients.view(batch_size, num_frames, C, H, W)
+        
+        # Initialize an empty list to store frame-level heatmaps
+        cam_heatmaps = []
+
+        for b in range(batch_size):
+            # We process one video (sequence) at a time
+            
+            # Global Average Pooling on Gradients to get alpha_k^c (importance weights)
+            # Take the mean over spatial dimensions (H, W) for each frame and channel
+            # Shape is (Num_frames, Channels)
+            alpha_k_c = torch.mean(gradients[b], dim=(2, 3), keepdim=False) 
+
+            video_heatmaps = []
+            for t in range(num_frames):
+                # Calculate the weighted feature map for the current frame 't'
+                # (Channels) @ (Channels, H, W) -> (H, W)
+                weighted_features = (alpha_k_c[t].unsqueeze(-1).unsqueeze(-1) * feature_maps[b, t]).sum(dim=0)
+                
+                # Apply ReLU
+                cam = F.relu(weighted_features)
+                
+                # Normalize and Upsample (assuming input image size is 224x224)
+                cam = cam.cpu().detach().numpy()
+                cam = cam - np.min(cam)
+                cam = cam / (np.max(cam) + 1e-8)
+                
+                # Resize to match the original frame's spatial dimensions (e.g., 224x224)
+                # You'll need to handle the actual resizing in your visualization code
+                # For simplicity here, we just store the normalized CAM map
+                video_heatmaps.append(cam)
+                
+            cam_heatmaps.append(video_heatmaps)
+
+        return cam_heatmaps, target_category
